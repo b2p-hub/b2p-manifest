@@ -1,0 +1,115 @@
+name: Rebuild Manifest (weekly)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 4 * * 0"   # So 04:00 UTC
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install deps
+        run: pip install "requests>=2.31.0" "feedparser>=6.0.11"
+
+      - name: Rebuild manifest_latest.csv
+        run: |
+          python - <<'PY'
+import csv, math, re, html, time
+from datetime import datetime
+from pathlib import Path
+import requests, feedparser
+
+FEED_URL = "https://letscast.fm/podcasts/bauertothepeople-b2p-der-podcast-hinter-den-kulissen-von-deinem-essen-de5c15c4/feed"
+EXCLUDE_TITLE = "Hintergrundrauschen"
+GITHUB_JSDELIVR = "https://cdn.jsdelivr.net/gh/b2p-hub/b2p-vtts@main/{num}.vtt"
+GITHUB_RAW      = "https://raw.githubusercontent.com/b2p-hub/b2p-vtts/main/{num}.vtt"
+
+S = requests.Session()
+S.headers.update({"User-Agent": "b2p-manifest-ci/1.0"})
+
+def is_real_vtt(url):
+    try:
+        r = S.head(url, allow_redirects=True, timeout=20)
+        if r.status_code >= 400: return False
+    except: return False
+    try:
+        r = S.get(url, stream=True, timeout=30)
+        r.raise_for_status()
+        first = b""
+        for chunk in r.iter_content(chunk_size=2048):
+            if not chunk: break
+            first += chunk
+            if len(first) >= 2048: break
+        return (b"webvtt" in first.lower())
+    except: return False
+
+def episode_num(entry, idx, width):
+    ep = entry.get("itunes_episode")
+    if isinstance(ep,(int,float)) and ep>0: return str(int(ep)).zfill(width)
+    m = re.search(r"\bB2P(\d{2,4})\b", entry.get("title",""), flags=re.I)
+    if m: return m.group(1).zfill(width)
+    return str(idx+1).zfill(width)
+
+def find_feed_vtt(entry):
+    for L in entry.get("links", []):
+        if (L.get("type") or "").lower().startswith("text/vtt") and L.get("href"):
+            return L["href"]
+    link = entry.get("link") or ""
+    if link: return link.rstrip("/") + "/transcript.vtt"
+    return None
+
+def best_vtt(num_str, entry):
+    cand_feed = find_feed_vtt(entry)
+    if cand_feed and is_real_vtt(cand_feed): return cand_feed, "feed"
+    js = GITHUB_JSDELIVR.format(num=num_str)
+    if is_real_vtt(js): return js, "github_cdn"
+    raw = GITHUB_RAW.format(num=num_str)
+    if is_real_vtt(raw): return raw, "github_raw"
+    return "", "none"
+
+d = feedparser.parse(FEED_URL)
+entries = [e for e in d.entries if EXCLUDE_TITLE.lower() not in (e.get("title") or "").lower()]
+entries.sort(key=lambda e: e.get("published_parsed") or e.get("updated_parsed") or 0)
+width = max(3, 3)
+
+out = Path("manifest_latest.csv")
+with out.open("w", newline="", encoding="utf-8") as f:
+    w = csv.writer(f)
+    w.writerow([
+        "episode_num","title","date","link","audio_url",
+        "transcript_url_feed","transcript_url_jsdelivr","transcript_url_raw",
+        "transcript_url_final","vtt_source","guid"
+    ])
+    for i,e in enumerate(entries):
+        num = episode_num(e, i, width)
+        # Audio
+        audio = ""
+        for L in e.get("links",[]):
+            if (L.get("rel")=="enclosure") and "audio" in (L.get("type") or "") and L.get("href"):
+                audio = L["href"]; break
+        feed_vtt = find_feed_vtt(e) or ""
+        js_vtt   = GITHUB_JSDELIVR.format(num=num)
+        raw_vtt  = GITHUB_RAW.format(num=num)
+        final, src = best_vtt(num, e)
+        # Datum
+        dt = e.get("published") or e.get("updated") or ""
+        guid = (e.get("id") or e.get("guid") or "").strip()
+        w.writerow([num, e.get("title","").strip(), dt, e.get("link",""), audio,
+                    feed_vtt, js_vtt, raw_vtt, final, src, guid])
+PY
+
+      - name: Commit & push if changed
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "ci: rebuild manifest_latest.csv"
+          file_pattern: manifest_latest.csv
